@@ -1,3 +1,4 @@
+// Modified for tty7-pad; see NOTICE.
 // The app's icons, drawn in the desktop's grammar: 24-unit box, 1.8 stroke,
 // round caps and joins. Agent marks are the desktop's own files.
 
@@ -6,6 +7,7 @@ const stroke = (body: string, width = 1.8) =>
 
 export const icon = {
   back: stroke(`<path d="M15 5 8 12l7 7"/>`, 2.2),
+  sidebar: stroke(`<rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M9.5 4.5v15"/>`),
   chevron: stroke(`<path d="m9.5 6 6 6-6 6"/>`, 2),
   plus: stroke(`<path d="M12 5v14M5 12h14"/>`, 2),
   more: `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5.5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="18.5" cy="12" r="1.7"/></svg>`,

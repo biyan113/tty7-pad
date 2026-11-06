@@ -1,3 +1,4 @@
+// Modified for tty7-pad; see NOTICE.
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
@@ -33,6 +34,13 @@ import logoUrl from "./assets/logo.svg?url";
 const app = document.getElementById("app")!;
 
 const android = /Android/.test(navigator.userAgent);
+
+// A tablet: 600dp on its short side, Android's own line. It lays out as two
+// places side by side (`mount`) and is called a tablet wherever the app names
+// the device; a phone runs this build exactly as it runs tty7 mobile.
+const pad = Math.min(window.screen.width, window.screen.height) >= 600;
+document.documentElement.classList.toggle("pad", pad);
+const device = pad ? "tablet" : "phone";
 
 // The keyboard. The WebView runs edge to edge and is never resized for it
 // (lib.rs `edge_to_edge`): the keyboard simply covers the bottom of the page.
@@ -86,6 +94,18 @@ if (android) {
   void fitInsets();
   window.addEventListener("resize", () => void fitInsets());
 }
+
+// A keyboard with keys, docked or over Bluetooth. Android says when one comes
+// and goes (MainActivity); it takes the on-screen key row's place.
+let hardKeyboard = false;
+function setHardKeyboard(on: boolean) {
+  hardKeyboard = on;
+  document.documentElement.classList.toggle("hard-keyboard", on);
+  window.dispatchEvent(new CustomEvent("hard-keyboard"));
+}
+window.addEventListener("native-hard-keyboard", (e) => setHardKeyboard((e as CustomEvent<{ on: boolean }>).detail.on));
+if (android) api.hardKeyboard().then(setHardKeyboard, () => {});
+else setHardKeyboard(matchMedia("(any-pointer: fine)").matches);
 
 // ---------------------------------------------------------------------------
 // A tiny DOM helper. Four screens do not justify a framework, and the
@@ -156,9 +176,19 @@ interface Prefs {
   /** Face ID (or the passcode) before the app shows, on launch and after a
    * minute away. */
   lock: boolean;
+  /** The terminal's colours: a `TERM_THEMES` name, or "app" to follow the
+   * app's light or dark. */
+  termTheme: string;
 }
 
-const PREFS: Prefs = { appearance: "system", textSize: 11, wide: "readable", lock: false };
+// A tablet is read from further off, and has the width to show a pane whole.
+const PREFS: Prefs = {
+  appearance: pad ? "dark" : "system",
+  textSize: pad ? 14 : 11,
+  wide: pad ? "fit" : "readable",
+  lock: false,
+  termTheme: pad ? "tokyo-night" : "app",
+};
 
 const prefs: Prefs = (() => {
   try {
@@ -172,6 +202,10 @@ function setPref<K extends keyof Prefs>(key: K, value: Prefs[K]) {
   prefs[key] = value;
   remember("prefs", JSON.stringify(prefs));
   if (key === "appearance") applyAppearance();
+  if (key === "termTheme") {
+    paintTerminal();
+    window.dispatchEvent(new CustomEvent("theme"));
+  }
 }
 
 const systemDark = matchMedia("(prefers-color-scheme: dark)");
@@ -263,7 +297,10 @@ document.addEventListener("visibilitychange", () => {
     shade?.remove();
     shade = null;
     if (prefs.lock && Date.now() - hiddenAt > LOCK_AFTER_MS) lock();
-    onResume?.();
+    if (pad) {
+      sideSlot.resume?.();
+      mainSlot.resume?.();
+    } else onResume?.();
   } else {
     hiddenAt = Date.now();
     if (prefs.lock && !shade) {
@@ -318,7 +355,18 @@ const still = matchMedia("(prefers-reduced-motion: reduce)");
 let connectedTo: string | null = null;
 let held: string | null = null;
 
-function go(direction: "push" | "pop", render: () => HTMLElement) {
+function go(direction: "push" | "pop", render: () => HTMLElement, place: "side" | "main" = "side") {
+  if (pad) {
+    mount(place === "main" ? mainSlot : sideSlot, render);
+    if (place === "main") {
+      drawerOpen = false;
+      layoutShell();
+      window.dispatchEvent(new CustomEvent("pad-pane"));
+      for (const row of document.querySelectorAll<HTMLElement>(".pad-side [data-pane]"))
+        row.classList.toggle("open", row.dataset.pane === openPane);
+    }
+    return;
+  }
   const swap = () => {
     onLeave?.();
     onLeave = null;
@@ -353,7 +401,7 @@ document.addEventListener(
   "touchstart",
   (e) => {
     edgeSwipe = null;
-    if (!onBack || e.touches.length !== 1) return;
+    if (!edgeAction() || e.touches.length !== 1) return;
     // Not from under a sheet: the scrim covers the screen it would leave.
     if (!app.contains(e.target as Node)) return;
     const t = e.touches[0];
@@ -392,11 +440,178 @@ document.addEventListener(
     const t = e.changedTouches[0];
     const dx = t.clientX - swipe.x;
     // Far enough across, or flicked.
-    if (dx > Math.min(80, innerWidth * 0.25) || dx / Math.max(1, e.timeStamp - swipe.t) > 0.4) onBack?.();
+    if (dx > Math.min(80, innerWidth * 0.25) || dx / Math.max(1, e.timeStamp - swipe.t) > 0.4) edgeAction()?.();
   },
   { capture: true, passive: false },
 );
 document.addEventListener("touchcancel", () => (edgeSwipe = null), { capture: true, passive: true });
+
+// ---------------------------------------------------------------------------
+// The tablet's two places. Lists and settings are phone-shaped, and go in the
+// side; a pane goes in the main place beside them, so moving between panes is
+// one tap and the list keeps showing what every agent is doing. Each place
+// keeps its own screen's hooks, which a screen sets as it renders. Wide, the
+// side stays docked; narrow, as held upright, it is a drawer over the pane.
+
+interface Slot {
+  el: HTMLElement;
+  leave: (() => void) | null;
+  resume: (() => void) | null;
+  back: (() => void) | null;
+  host: string | null;
+}
+
+const slot = (el: HTMLElement): Slot => ({ el, leave: null, resume: null, back: null, host: null });
+const sideSlot = slot(h("aside", { class: "pad-side" }));
+const mainSlot = slot(h("section", { class: "pad-main" }));
+/** The pane in the main place, as `paneKey` names it. */
+let openPane: string | null = null;
+const paneKey = (hostId: string, where: { key: string } | null, paneId: unknown) => `${hostId}/${where?.key ?? ""}/${paneId}`;
+
+/** Wide enough to keep the list docked beside a usable pane. */
+const DOCK_MIN = 900;
+/** Wide enough for the keys and the message box to share a row. */
+const WIDE_MAIN = 720;
+
+const shellScrim = h("div", { class: "pad-scrim", onclick: () => toggleSide() });
+const shell = h("div", { class: "pad-shell" }, sideSlot.el, shellScrim, mainSlot.el);
+let sideWanted = remembered("pad.side") !== "hidden";
+let drawerOpen = false;
+const docked = () => window.innerWidth >= DOCK_MIN;
+// With no pane open there is nothing to give the room to.
+const sideShown = () => !openPane || (docked() ? sideWanted : drawerOpen);
+
+function layoutShell() {
+  const shown = sideShown();
+  shell.classList.toggle("docked", docked());
+  shell.classList.toggle("side-on", shown);
+  shell.classList.toggle("side-over", !docked() && shown && !!openPane);
+  shell.classList.toggle("no-pane", !openPane);
+  sideSlot.el.inert = !shown;
+}
+
+function toggleSide() {
+  if (docked()) {
+    sideWanted = !sideWanted;
+    remember("pad.side", sideWanted ? "" : "hidden");
+  } else drawerOpen = !drawerOpen;
+  layoutShell();
+}
+
+function mount(place: Slot, render: () => HTMLElement) {
+  place.leave?.();
+  onLeave = onResume = onBack = null;
+  connectedTo = null;
+  const view = render();
+  place.el.replaceChildren(view);
+  place.leave = onLeave;
+  place.resume = onResume;
+  place.back = onBack;
+  place.host = connectedTo;
+  onLeave = onResume = onBack = null;
+  // A pane left open keeps its machine up while the list moves on.
+  const wanted = mainSlot.host ?? sideSlot.host;
+  if (wanted !== held) {
+    held = wanted;
+    api.keepAlive(held).catch(() => {});
+  }
+}
+
+function emptyMain() {
+  return h(
+    "div",
+    { class: "screen pad-empty" },
+    h("img", { class: "empty-mark", src: logoUrl, alt: "" }),
+    h("h2", { class: "empty-title" }, "Pick a pane"),
+    h("p", { class: "pad-empty-text" }, "Choose a machine and a pane from the list, and it opens here."),
+  );
+}
+
+/** Puts the pane away: the list stays as it is. */
+function closeMain() {
+  openPane = null;
+  remember("pad.pane", "");
+  go("pop", emptyMain, "main");
+}
+
+/** What a swipe in from the left edge does. */
+function edgeAction(): (() => void) | null {
+  if (!pad) return onBack;
+  return sideShown() ? sideSlot.back : toggleSide;
+}
+
+/** What Android's Back does: the drawer, then the pane, then the list's own
+ * way back, the order they were opened in. */
+function padBack(): (() => void) | null {
+  if (!docked() && drawerOpen && openPane) return toggleSide;
+  return mainSlot.back ?? sideSlot.back;
+}
+
+/** Moves the main place through the panes as the list has them. */
+function stepPane(by: number) {
+  const rows = [...document.querySelectorAll<HTMLElement>(".pad-side [data-pane]")];
+  if (!rows.length) return;
+  const at = rows.findIndex((row) => row.classList.contains("open"));
+  rows[at < 0 ? (by > 0 ? 0 : rows.length - 1) : (at + by + rows.length) % rows.length].click();
+}
+
+// What the shortcuts reach, set by the screens that offer it.
+let paneKeys: { find: () => void; press: (e: KeyboardEvent) => void } | null = null;
+let padNewTab: (() => void) | null = null;
+
+/** Ctrl-Shift, which a terminal program never sees as anything of its own. */
+function shortcut(code: string): (() => void) | null {
+  if (code === "KeyB") return toggleSide;
+  if (code === "KeyT") return padNewTab;
+  if (code === "KeyF") return paneKeys?.find ?? null;
+  if (code === "BracketRight") return () => stepPane(1);
+  if (code === "BracketLeft") return () => stepPane(-1);
+  const digit = /^Digit([1-9])$/.exec(code);
+  if (digit)
+    return () => document.querySelectorAll<HTMLElement>(".pad-side [data-pane]")[Number(digit[1]) - 1]?.click();
+  return null;
+}
+
+if (pad) {
+  app.append(shell);
+  mount(mainSlot, emptyMain);
+  layoutShell();
+  window.addEventListener("resize", layoutShell);
+  // The pane's room changes with the list as well as the window. Screens lay
+  // out by the window's resize; heard once the list has finished moving.
+  let width = 0;
+  let settling: number | undefined;
+  new ResizeObserver(([entry]) => {
+    const now = Math.round(entry.contentRect.width);
+    mainSlot.el.classList.toggle("wide", now >= WIDE_MAIN);
+    if (now === width) return;
+    width = now;
+    clearTimeout(settling);
+    settling = window.setTimeout(() => window.dispatchEvent(new Event("resize")), 260);
+  }).observe(mainSlot.el);
+
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.ctrlKey && e.shiftKey && !e.altKey) {
+        const run = shortcut(e.code);
+        if (run) {
+          e.preventDefault();
+          e.stopPropagation();
+          run();
+          return;
+        }
+      }
+      // Keys pressed with no field in focus are the pane's: tapping the list
+      // should not leave the keyboard typing into nothing.
+      const at = document.activeElement;
+      if (paneKeys && hardKeyboard && !(at instanceof HTMLInputElement || at instanceof HTMLTextAreaElement) && !document.querySelector("body > .scrim"))
+        paneKeys.press(e);
+    },
+    { capture: true },
+  );
+}
 
 // A tap on nothing in particular puts the keyboard away, as it does in the
 // phone's own apps: there is no Done bar over it (lib.rs `keyboard`). Taps
@@ -428,8 +643,11 @@ if (android)
     else if (sheet) sheet.click();
     // A menu closes on a press anywhere outside it.
     else if (menu) document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
-    else if (onBack) onBack();
-    else void api.toBackground();
+    else {
+      const back = pad ? padBack() : onBack;
+      if (back) back();
+      else void api.toBackground();
+    }
   }).catch(() => {});
 
 interface ScreenParts {
@@ -579,8 +797,9 @@ function hostsScreen(direction: "push" | "pop" = "pop") {
     const render = () => {
       const shown = all.filter((host) => host.name.toLowerCase().includes(query));
       body.replaceChildren(
+        sshSection(),
         shown.length
-          ? section(null, ...shown.map((host) => hostRow(host, all)))
+          ? section("tty7", ...shown.map((host) => hostRow(host, all)))
           : h("p", { class: "search-empty" }, `No machine matches “${query}”.`),
       );
     };
@@ -588,6 +807,7 @@ function hostsScreen(direction: "push" | "pop" = "pop") {
       all = hosts;
       if (hosts.length === 0) {
         body.replaceChildren(
+          sshSection(),
           h(
             "div",
             { class: "empty" },
@@ -596,7 +816,7 @@ function hostsScreen(direction: "push" | "pop" = "pop") {
             h(
               "p",
               { class: "empty-body" },
-              "Reach the panes open in tty7 on your computer, and type into them from here. In tty7, open Settings → Mobile and point this phone's camera at the code.",
+              `Reach the panes open in tty7 on your computer, and type into them from here. In tty7, open Settings → Mobile and point this ${device}'s camera at the code.`,
             ),
             h("button", { class: "button primary", onclick: () => pairScreen() }, "Pair a machine"),
           ),
@@ -613,6 +833,211 @@ function hostsScreen(direction: "push" | "pop" = "pop") {
 }
 
 // ---------------------------------------------------------------------------
+// SSH: a terminal on any machine by its address, with no tty7 there and no
+// pairing. Addresses are kept on this device; passwords only in memory.
+
+interface SshProfile {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+}
+
+/** The Linux on this tablet: what the app opens by itself. */
+const DEFAULT_SSH: SshProfile = { id: "ubuntu", name: "Ubuntu", host: "192.168.50.161", port: 22, user: "root" };
+
+const sshPasswords = new Map<string, string>();
+
+function sshProfiles(): SshProfile[] {
+  try {
+    const saved = JSON.parse(remembered("ssh.list") ?? "null");
+    // One saved before it had a user is an unfinished default.
+    const usable = Array.isArray(saved) ? saved.filter((p: SshProfile) => p.user) : [];
+    if (usable.length) return usable;
+  } catch {
+    // Unreadable: the default stands.
+  }
+  return [DEFAULT_SSH];
+}
+
+function saveSshProfile(profile: SshProfile) {
+  const all = sshProfiles();
+  const at = all.findIndex((p) => p.id === profile.id);
+  if (at >= 0) all[at] = profile;
+  else all.push(profile);
+  remember("ssh.list", JSON.stringify(all));
+}
+
+const sshAddress = (p: SshProfile) => `${p.user ? `${p.user}@` : ""}${p.host}:${p.port}`;
+
+/** Opens a connection, asking first for whatever it has not been told. */
+function openSsh(profile: SshProfile) {
+  if (!profile.user) return void sshForm(profile);
+  const host = { id: `ssh:${profile.id}`, name: profile.name, addrs: [] } as Host;
+  terminalScreen(host, null, { id: 0, title: profile.name, cwd: null } as PaneView, profile.name, undefined, undefined, true, profile);
+}
+
+function sshForm(profile?: SshProfile) {
+  const field = (label: string, value: string, extra: Partial<HTMLInputElement> = {}) => {
+    const input = h("input", { class: "field-input", value, placeholder: label, ariaLabel: label, autocapitalize: "off", spellcheck: false, ...extra });
+    input.setAttribute("autocorrect", "off");
+    return input;
+  };
+  const name = field("Name", profile?.name ?? "");
+  const host = field("Address", profile?.host ?? "");
+  const port = field("Port", String(profile?.port ?? 22), { inputMode: "numeric" });
+  const user = field("User", profile?.user ?? "");
+  const password = field("Password", profile ? (sshPasswords.get(profile.id) ?? "") : "", { type: "password" });
+  const error = h("p", { class: "field-error", role: "alert" });
+  const connect = h("button", { class: "button primary wide" }, "Connect");
+  const sheet = openSheet(
+    profile ? profile.name : "SSH connection",
+    h("div", { class: "sheet-body ssh-form" }, name, host, port, user, password, error, connect),
+  );
+  connect.onclick = () => {
+    const portNumber = Number(port.value);
+    if (!host.value.trim() || !user.value.trim() || !Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) {
+      error.textContent = "An address, a port and a user are needed.";
+      return;
+    }
+    const saved: SshProfile = {
+      id: profile?.id ?? `${Date.now()}`,
+      name: name.value.trim() || host.value.trim(),
+      host: host.value.trim(),
+      port: portNumber,
+      user: user.value.trim(),
+    };
+    if (password.value) sshPasswords.set(saved.id, password.value);
+    saveSshProfile(saved);
+    sheet.close();
+    // The list beside the pane shows it from now on.
+    if (pad) hostsScreen();
+    openSsh(saved);
+  };
+}
+
+function sshPasswordSheet(profile: SshProfile, wrong: boolean): Promise<string | null> {
+  return new Promise((done) => {
+    const password = h("input", { class: "field-input", type: "password", placeholder: "Password", ariaLabel: "Password" });
+    const go = h("button", { class: "button primary wide" }, "Connect");
+    const skip = h("button", { class: "button tinted wide" }, "Cancel");
+    const sheet = openSheet(
+      `Password for ${profile.user}`,
+      h(
+        "div",
+        { class: "sheet-body ssh-form" },
+        h("p", { class: "sheet-text" }, wrong ? "That password didn't work." : `${sshAddress(profile)} asks for a password. It's needed once: this ${device}'s key is left there for next time.`),
+        password,
+        go,
+        skip,
+      ),
+    );
+    go.onclick = () => (sheet.close(), done(password.value));
+    skip.onclick = () => (sheet.close(), done(null));
+    password.focus();
+  });
+}
+
+/** Connects, stopping to ask about a key or a password as it needs to. */
+async function sshConnect(
+  profile: SshProfile,
+  grid: { cols: number; rows: number },
+  onOutput: (bytes: Uint8Array) => void,
+  onEvent: (event: api.PaneEvent) => void,
+) {
+  const knownKey = `ssh.known.${profile.host}:${profile.port}`;
+  for (;;) {
+    const fingerprint = remembered(knownKey) || undefined;
+    const password = sshPasswords.get(profile.id);
+    try {
+      return await api.sshOpen(
+        { host: profile.host, port: profile.port, user: profile.user, password, fingerprint, remember: true, ...grid },
+        onOutput,
+        onEvent,
+      );
+    } catch (e) {
+      const text = errorText(e);
+      const seen = /^hostkey:(.+)$/.exec(text);
+      if (seen) {
+        const trusted = await confirmSheet(
+          fingerprint ? "This machine's key has changed" : `First time connecting to ${profile.name}`,
+          fingerprint
+            ? `Someone could be in the way, or the machine was set up again. Its key is now ${seen[1]}`
+            : `Its key is ${seen[1]}`,
+          fingerprint ? "Trust the new key" : "Trust",
+        );
+        if (!trusted) throw new Error("Not connected: its key wasn't trusted.");
+        remember(knownKey, seen[1]);
+        continue;
+      }
+      if (text.startsWith("auth:")) {
+        if (text === "auth:wrong") sshPasswords.delete(profile.id);
+        const typed = await sshPasswordSheet(profile, text === "auth:wrong");
+        if (!typed) throw new Error("Not signed in.");
+        sshPasswords.set(profile.id, typed);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+function sshRow(profile: SshProfile) {
+  const row = h(
+    "button",
+    { class: "row machine", onclick: () => openSsh(profile) },
+    h("span", { class: "tile" }, ico("terminal")),
+    h(
+      "span",
+      { class: "row-text" },
+      h("span", { class: "row-title" }, profile.name),
+      h("span", { class: "row-sub" }, sshAddress(profile)),
+    ),
+    ico("chevron", "icon row-chevron"),
+  );
+  row.dataset.pane = paneKey(`ssh:${profile.id}`, null, 0);
+  rowActions(row, () => ({
+    title: profile.name,
+    actions: [
+      { label: "Edit", icon: "compose", run: () => sshForm(profile) },
+      {
+        label: `Copy this ${device}'s key`,
+        icon: "copy",
+        run: () => void api.sshPublicKey().then((key) => navigator.clipboard?.writeText(key)).then(() => feel("tick"), () => {}),
+      },
+      ...(profile.id === DEFAULT_SSH.id
+        ? []
+        : [
+            {
+              label: "Delete",
+              icon: "trash" as const,
+              danger: true,
+              run: () => {
+                remember("ssh.list", JSON.stringify(sshProfiles().filter((p) => p.id !== profile.id)));
+                hostsScreen();
+              },
+            },
+          ]),
+    ],
+  }));
+  return row;
+}
+
+function sshSection() {
+  return section(
+    "SSH",
+    ...sshProfiles().map(sshRow),
+    h(
+      "button",
+      { class: "row machine", onclick: () => sshForm() },
+      h("span", { class: "tile" }, ico("plus")),
+      h("span", { class: "row-text" }, h("span", { class: "row-title" }, "Add a connection")),
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 
 const APPEARANCES: { value: Appearance; label: string }[] = [
@@ -621,12 +1046,19 @@ const APPEARANCES: { value: Appearance; label: string }[] = [
   { value: "dark", label: "Dark" },
 ];
 
-const TEXT_SIZES = [
-  { value: 10, label: "Small" },
-  { value: 11, label: "Default" },
-  { value: 13, label: "Large" },
-  { value: 15, label: "Larger" },
-];
+const TEXT_SIZES = pad
+  ? [
+      { value: 12, label: "Small" },
+      { value: 14, label: "Default" },
+      { value: 16, label: "Large" },
+      { value: 18, label: "Larger" },
+    ]
+  : [
+      { value: 10, label: "Small" },
+      { value: 11, label: "Default" },
+      { value: 13, label: "Large" },
+      { value: 15, label: "Larger" },
+    ];
 
 const WIDE = [
   { value: "readable", label: "Keep the text readable", meta: "Pan sideways" },
@@ -695,7 +1127,7 @@ function settingsScreen() {
         h("span", { class: "row-meta" }, saved ? `${saved} saved` : "Empty"),
       );
       clear.onclick = async () => {
-        if (!(await confirmSheet("Clear message history?", `The ${saved} messages kept on this phone go for good.`, "Clear")))
+        if (!(await confirmSheet("Clear message history?", `The ${saved} messages kept on this ${device} go for good.`, "Clear")))
           return;
         remember("history", "[]");
         draw();
@@ -714,7 +1146,11 @@ function settingsScreen() {
           "The size panes are read at. Applies to the next pane you open.",
         ),
         note(
-          section("Panes wider than the phone", ...choices(WIDE, prefs.wide, (v) => setPref("wide", v))),
+          section(
+            "Terminal theme",
+            ...choices(TERM_THEME_CHOICES, prefs.termTheme, (v) => setPref("termTheme", v), (v) => themeSwatch(v)),
+          ),
+          section(`Panes wider than the ${device}`, ...choices(WIDE, prefs.wide, (v) => setPref("wide", v))),
           "How such a pane first shows. Switch any time from its ",
           // The menu's own mark: the phone's fonts have no ⋯ of their own.
           ico("more", "icon inline-icon"),
@@ -736,7 +1172,7 @@ function settingsScreen() {
         ...(lockable ? [lockSetting()] : []),
         note(
           section("Message history", clear),
-          "What you send from the message box is kept on this phone, to suggest as you write and to search from the history button.",
+          `What you send from the message box is kept on this ${device}, to suggest as you write and to search from the history button.`,
         ),
         section(
           "About",
@@ -997,8 +1433,8 @@ function pairScreen(linked?: string) {
     const name = h("input", {
       class: "field-input",
       value: guessDeviceName(),
-      placeholder: "This phone",
-      ariaLabel: "This phone's name",
+      placeholder: `This ${device}`,
+      ariaLabel: `This ${device}'s name`,
       autocapitalize: "words",
     });
     const error = h("p", { class: "field-error", role: "alert" });
@@ -1056,7 +1492,7 @@ function pairScreen(linked?: string) {
       submit.classList.add("busy");
       submit.textContent = "Pairing…";
       try {
-        const host = await api.pair(code.value.trim(), name.value.trim() || "phone");
+        const host = await api.pair(code.value.trim(), name.value.trim() || device);
         await replaceOlderPairings(host);
         hostScreen(host, "push");
       } catch (e) {
@@ -1105,7 +1541,7 @@ function pairScreen(linked?: string) {
               "Click ",
               h("strong", {}, "Show code"),
               canScan
-                ? ", then point this phone's Camera at it, or scan it here, or paste the code below."
+                ? `, then point this ${device}'s Camera at it, or scan it here, or paste the code below.`
                 : ", copy the code and paste it below.",
             ),
           ),
@@ -1130,7 +1566,7 @@ function pairScreen(linked?: string) {
           h(
             "p",
             { class: "group-note" },
-            "How this phone shows up under ",
+            `How this ${device} shows up under `,
             h("strong", {}, "Paired phones"),
             " on your computer.",
           ),
@@ -1145,7 +1581,7 @@ function guessDeviceName() {
   const ua = navigator.userAgent;
   if (/iPhone/.test(ua)) return "iPhone";
   if (/iPad/.test(ua)) return "iPad";
-  if (/Android/.test(ua)) return "Android";
+  if (/Android/.test(ua)) return pad ? "Android tablet" : "Android";
   return "tty7 mobile";
 }
 
@@ -1246,11 +1682,18 @@ function hostScreen(host: Host, direction: "push" | "pop" = "pop") {
           ) {
             await api.forget(host.id);
             trees.delete(host.id);
+            if (pad && mainSlot.host === host.name) closeMain();
             hostsScreen();
           }
         },
       },
     ]);
+
+    padNewTab = () => lastTree && newTabSheet(host, lastTree, failed, picked);
+    // The row of the pane on show follows it.
+    window.addEventListener("pad-pane", draw);
+    // Once a visit, on the first live tree: the pane last left open.
+    let reopened = false;
 
     const view = screen({
       title: host.name,
@@ -1288,6 +1731,8 @@ function hostScreen(host: Host, direction: "push" | "pop" = "pop") {
       clearTimeout(quiet);
       retry.cancel();
       window.removeEventListener("online", online);
+      window.removeEventListener("pad-pane", draw);
+      padNewTab = null;
     };
 
     const failed = (message: string) =>
@@ -1344,7 +1789,7 @@ function hostScreen(host: Host, direction: "push" | "pop" = "pop") {
               body: [
                 "Check that tty7 is running there with phone access on (",
                 h("strong", {}, "Settings → Mobile"),
-                "). If the network changed since you paired, pairing again gives this phone its new address.",
+                `). If the network changed since you paired, pairing again gives this ${device} its new address.`,
               ],
               tone: "warn",
               actions: [{ label: "Pair again", run: () => pairScreen() }],
@@ -1365,6 +1810,10 @@ function hostScreen(host: Host, direction: "push" | "pop" = "pop") {
               trees.set(host.id, msg.tree);
               seen.set(host.id, { link: seen.get(host.id)?.link ?? null, tabs: tabCount(msg.tree) });
               draw();
+              if (pad && !reopened) {
+                reopened = true;
+                reopenPane(host, msg.tree);
+              }
               break;
             case "link":
               showLink(msg.link);
@@ -1408,6 +1857,33 @@ function hostScreen(host: Host, direction: "push" | "pop" = "pop") {
     start();
     return view;
   });
+}
+
+/** Back on a tablet, the pane that was left open is open again, if it is
+ * still there and still running. */
+function reopenPane(host: Host, tree: Tree) {
+  if (openPane) return;
+  let saved: { host?: string; place?: string; pane?: unknown } | null = null;
+  try {
+    saved = JSON.parse(remembered("pad.pane") || "null");
+  } catch {
+    return;
+  }
+  if (saved?.host !== host.id) return;
+  const spaces: [Place, WorkspaceView][] = [
+    ...tree.workspaces.map((ws): [Place, WorkspaceView] => [null, ws]),
+    ...(tree.remotes ?? []).flatMap((r) => r.workspaces.map((ws): [Place, WorkspaceView] => [{ key: r.key, name: r.name }, ws])),
+  ];
+  for (const [where, ws] of spaces) {
+    if ((where?.key ?? "") !== saved.place) continue;
+    for (const tab of ws.tabs)
+      for (const pane of tab.panes)
+        if (pane.id === saved.pane && !pane.stopped && !tab.hibernated) {
+          const name = /^[~/]/.test(tab.name) ? baseName(tab.name) : tab.name;
+          terminalScreen(host, where, pane, name, tabRef(ws, tab, name));
+          return;
+        }
+  }
 }
 
 function renderLink(el: HTMLElement, link: LinkInfo | null) {
@@ -2043,7 +2519,7 @@ function phoneGrid() {
   probe.remove();
   const chrome = 44 + insets + 132 + 16;
   return {
-    cols: Math.max(20, Math.floor((window.innerWidth - 12) / cellW)),
+    cols: Math.max(20, Math.floor(((pad ? mainSlot.el.clientWidth : window.innerWidth) - 12) / cellW)),
     rows: Math.max(5, Math.floor((window.innerHeight - chrome) / cellH)),
   };
 }
@@ -2235,11 +2711,15 @@ function paneRow(host: Host, place: Place, ws: WorkspaceView, tab: TabView, pane
     agent && !pane.stopped && agent.status !== "idle" && agent.status !== "done" && h("span", { class: `status-dot ${agent.status}` }),
     ico("chevron", "icon row-chevron"),
   );
+  if (pad) {
+    row.dataset.pane = paneKey(host.id, place, pane.id);
+    row.classList.toggle("open", row.dataset.pane === openPane);
+  }
   rowActions(row, () => {
     const actions: { label: string; icon: keyof typeof icon; danger?: boolean; run: () => void }[] = [
       { label: "Open", icon: "terminal", run: () => terminalScreen(host, place, pane, name, tabRef(ws, tab, name)) },
       {
-        label: "Open at phone size",
+        label: `Open at ${device} size`,
         icon: "phone",
         run: () => {
           remember(`take.${host.id}.${place?.key ?? ""}.${pane.id}`, "1");
@@ -2510,15 +2990,123 @@ const ANSI = {
 };
 const NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"] as const;
 
+/** Colour schemes for the terminal alone: 8 ANSI colours, then their bright
+ * halves. All dark, each the scheme's own published palette. */
+const TERM_THEMES: Record<string, { label: string; background: string; foreground: string; ansi: string[] }> = {
+  "tokyo-night": {
+    label: "Tokyo Night",
+    background: "#1a1b26",
+    foreground: "#c0caf5",
+    ansi: ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6", "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"],
+  },
+  catppuccin: {
+    label: "Catppuccin Mocha",
+    background: "#1e1e2e",
+    foreground: "#cdd6f4",
+    ansi: ["#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de", "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8"],
+  },
+  dracula: {
+    label: "Dracula",
+    background: "#282a36",
+    foreground: "#f8f8f2",
+    ansi: ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2", "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"],
+  },
+  nord: {
+    label: "Nord",
+    background: "#2e3440",
+    foreground: "#d8dee9",
+    ansi: ["#3b4252", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0", "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#8fbcbb", "#eceff4"],
+  },
+  "one-dark": {
+    label: "One Dark",
+    background: "#282c34",
+    foreground: "#abb2bf",
+    ansi: ["#282c34", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#abb2bf", "#5c6370", "#e06c75", "#98c379", "#e5c07b", "#61afef", "#c678dd", "#56b6c2", "#ffffff"],
+  },
+  gruvbox: {
+    label: "Gruvbox Dark",
+    background: "#282828",
+    foreground: "#ebdbb2",
+    ansi: ["#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a", "#a89984", "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c", "#ebdbb2"],
+  },
+  solarized: {
+    label: "Solarized Dark",
+    background: "#002b36",
+    foreground: "#839496",
+    ansi: ["#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3"],
+  },
+};
+
+const TERM_THEME_CHOICES = [
+  ...Object.entries(TERM_THEMES).map(([value, t]) => ({ value, label: t.label })),
+  { value: "app", label: "Follow the app" },
+];
+
+/** A chosen scheme's background reaches past xterm, to the pane's edges. */
+function paintTerminal() {
+  const chosen = TERM_THEMES[prefs.termTheme];
+  const root = document.documentElement;
+  if (chosen) root.style.setProperty("--term", chosen.background);
+  else root.style.removeProperty("--term");
+  // Every scheme is dark: the bars around the pane go with it, whatever the
+  // app's own appearance (style.css).
+  root.dataset.term = chosen ? "dark" : "";
+}
+paintTerminal();
+
+/** A strip of a scheme's colours, for picking it by eye. */
+function themeSwatch(name: string) {
+  const t = TERM_THEMES[name];
+  if (!t) return null;
+  const strip = h("span", { class: "theme-swatch" });
+  strip.style.background = t.background;
+  for (const colour of [t.foreground, t.ansi[1], t.ansi[2], t.ansi[4]]) {
+    const dot = h("span");
+    dot.style.background = colour;
+    strip.append(dot);
+  }
+  return strip;
+}
+
+function themeSheet() {
+  const rows = () =>
+    TERM_THEME_CHOICES.map((o) =>
+      h(
+        "button",
+        {
+          class: "row choice",
+          onclick: () => {
+            setPref("termTheme", o.value);
+            list.replaceChildren(...rows());
+          },
+        },
+        h("span", { class: "row-title" }, o.label),
+        themeSwatch(o.value),
+        o.value === prefs.termTheme ? ico("check", "icon choice-check") : h("span", { class: "choice-check" }),
+      ),
+    );
+  const list = h("div", { class: "card" }, ...rows());
+  openSheet("Terminal theme", h("div", { class: "sheet-body" }, list));
+}
+
 function terminalTheme(): ITheme {
   const dark = isDark();
-  const ansi = dark ? ANSI.dark : ANSI.light;
-  const theme: Record<string, string> = dark
-    ? { background: "#1e1e20", foreground: "#ececed", cursor: "#ececed", cursorAccent: "#1e1e20", selectionBackground: "#ffffff2e" }
-    : { background: "#fcfcfb", foreground: "#1c1c1e", cursor: "#1c1c1e", cursorAccent: "#fcfcfb", selectionBackground: "#0000001f" };
+  const chosen = TERM_THEMES[prefs.termTheme];
+  const ansi = chosen?.ansi ?? (dark ? ANSI.dark : ANSI.light);
+  const theme: Record<string, string> = chosen
+    ? {
+        background: chosen.background,
+        foreground: chosen.foreground,
+        cursor: chosen.foreground,
+        cursorAccent: chosen.background,
+        selectionBackground: "#ffffff2e",
+      }
+    : dark
+      ? { background: "#1e1e20", foreground: "#ececed", cursor: "#ececed", cursorAccent: "#1e1e20", selectionBackground: "#ffffff2e" }
+      : { background: "#fcfcfb", foreground: "#1c1c1e", cursor: "#1c1c1e", cursorAccent: "#fcfcfb", selectionBackground: "#0000001f" };
   // xterm's scrollbar, drawn to match the system indicator WebKit gives the
   // pan (style.css shapes it).
-  const bar = dark ? "#ffffff" : "#000000";
+  const bar = dark || chosen ? "#ffffff" : "#000000";
   theme.scrollbarSliderBackground = `${bar}59`;
   theme.scrollbarSliderHoverBackground = `${bar}59`;
   theme.scrollbarSliderActiveBackground = `${bar}73`;
@@ -2643,6 +3231,47 @@ function keySequence(written: string) {
   });
 }
 
+const CURSOR_KEYS: Record<string, string> = { ArrowUp: "A", ArrowDown: "B", ArrowRight: "C", ArrowLeft: "D", Home: "H", End: "F" };
+const TILDE_KEYS: Record<string, number> = {
+  Insert: 2, Delete: 3, PageUp: 5, PageDown: 6,
+  F5: 15, F6: 17, F7: 18, F8: 19, F9: 20, F10: 21, F11: 23, F12: 24,
+};
+const FUNCTION_KEYS: Record<string, string> = { F1: "P", F2: "Q", F3: "R", F4: "S" };
+
+/** What a key on a real keyboard sends, as xterm would; null for what goes in
+ * as text, or is not the terminal's. */
+function keyBytes(e: KeyboardEvent, applicationCursor: boolean): string | null {
+  if (e.metaKey) return null;
+  const mod = 1 + (e.shiftKey ? 1 : 0) + (e.altKey ? 2 : 0) + (e.ctrlKey ? 4 : 0);
+  const cursor = CURSOR_KEYS[e.key];
+  if (cursor) return mod > 1 ? `\x1b[1;${mod}${cursor}` : `\x1b${applicationCursor ? "O" : "["}${cursor}`;
+  const tilde = TILDE_KEYS[e.key];
+  if (tilde) return mod > 1 ? `\x1b[${tilde};${mod}~` : `\x1b[${tilde}~`;
+  const fn = FUNCTION_KEYS[e.key];
+  if (fn) return mod > 1 ? `\x1b[1;${mod}${fn}` : `\x1bO${fn}`;
+  switch (e.key) {
+    case "Escape":
+      return "\x1b";
+    case "Tab":
+      return e.shiftKey ? "\x1b[Z" : "\t";
+    case "Enter":
+      return e.altKey ? "\x1b\r" : "\r";
+    case "Backspace":
+      return e.ctrlKey ? "\b" : e.altKey ? "\x1b\x7f" : "\x7f";
+  }
+  if (e.key.length !== 1) return null;
+  // Ctrl and Alt together are AltGr on many layouts: that is text.
+  if (e.ctrlKey && !e.altKey) {
+    if (e.key === " " || e.key === "2") return "\0";
+    if (e.key === "/") return "\x1f";
+    if (e.key === "?") return "\x7f";
+    const c = e.key.toUpperCase().charCodeAt(0);
+    return c >= 64 && c <= 95 ? String.fromCharCode(c - 64) : null;
+  }
+  if (e.altKey && !e.ctrlKey) return `\x1b${e.key}`;
+  return null;
+}
+
 /** A key as the bar shows it. */
 function keyFace(k: Key) {
   return k.icon ? ico(k.icon) : (k.text ?? k.label);
@@ -2662,9 +3291,13 @@ const drafts = new Map<string, string>();
  * agent a new tab was opened for. */
 /** `made` is a tab this phone just opened: it runs at the phone's size from
  * the start, since nobody is reading it anywhere else yet. */
-function terminalScreen(host: Host, place: Place, pane: PaneView, title: string, tab?: TabRef, run?: string, made = false) {
+function terminalScreen(host: Host, place: Place, pane: PaneView, title: string, tab?: TabRef, run?: string, made = false, ssh?: SshProfile) {
   go("push", () => {
     connectedTo = host.name;
+    if (pad) {
+      openPane = paneKey(host.id, place, pane.id);
+      remember("pad.pane", JSON.stringify({ host: host.id, place: place?.key ?? "", pane: pane.id }));
+    }
     // What the pane is doing and whether keystrokes will land, in words: the
     // one line under the title.
     const stateWord = h("span", {}, "Connecting…");
@@ -2672,14 +3305,14 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
     // On a remote, the path says which machine it is on, the way a prompt does.
     const where = (path: string | null | undefined) =>
       place && path ? `${place.name}:${shortPath(path)}` : shortPath(path);
-    const cwd = h("span", { class: "term-cwd" }, where(pane.cwd));
+    const cwd = h("span", { class: "term-cwd" }, ssh ? sshAddress(ssh) : where(pane.cwd));
     let paneCwd = pane.cwd ?? null;
     const sub = h("span", { class: "term-sub" }, state, cwd);
     // Copying, the fit and the phone's size live in the ⋯ menu; the bar keeps
     // only the way back and what this is.
     const menu = menuButton(
       () => [
-        { label: "Select text", icon: "copy", run: () => selecting(copyView.hidden) },
+        { label: "Select text", icon: "copy", run: () => selecting(!!copyView.hidden) },
         { label: "Find", icon: "search", run: () => finding(true) },
         ...(paneCwd ? [{ label: "Changes", icon: "compose" as const, run: () => changesSheet(host, place, paneCwd!) }] : []),
         ...(cramped && !leased
@@ -2691,11 +3324,17 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
               },
             ]
           : []),
-        {
-          label: wanted ? "Give back the desktop's size" : "Use this phone's size",
-          icon: "phone" as const,
-          run: toggleTake,
-        },
+        { label: "Terminal theme", icon: "settings" as const, run: themeSheet },
+        ...(ssh
+          ? []
+          : [
+              {
+                label: wanted ? "Give back the desktop's size" : `Use this ${device}'s size`,
+                icon: "phone" as const,
+                run: toggleTake,
+              },
+            ]),
+        ...(pad ? [{ label: "Put this pane away", icon: "back" as const, run: closeMain }] : []),
         ...(tab?.split
           ? [
               {
@@ -2704,7 +3343,7 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
                 danger: true,
                 run: async () => {
                   // Nothing is left here to watch; the list drops it on its own.
-                  if (await closePane(host, place, pane, tab.name, (message) => showBanner(message))) hostScreen(host);
+                  if (await closePane(host, place, pane, tab.name, (message) => showBanner(message))) back();
                 },
               },
             ]
@@ -2724,8 +3363,7 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
                     !(await confirmSheet(`Close ${tab.name}?`, "You can reopen it from tty7 on your computer.", "Close tab"))
                   )
                     return;
-                  if (await closeTab(host, place, { ...tab, busy }, (message) => showBanner(message)))
-                    hostScreen(host);
+                  if (await closeTab(host, place, { ...tab, busy }, (message) => showBanner(message))) back();
                 },
               },
             ]
@@ -2733,12 +3371,15 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       ],
       "round",
     );
-    const back = () => hostScreen(host);
+    // On a tablet the list is still there beside it: only the pane goes.
+    const back = () => (pad ? closeMain() : ssh ? hostsScreen() : hostScreen(host));
     onBack = back;
     const bar = h(
       "header",
       { class: "term-nav" },
-      h("button", { class: "round term-back", ariaLabel: `Back to ${host.name}`, onclick: back }, ico("back")),
+      pad
+        ? h("button", { class: "round term-back", ariaLabel: "Show or hide the list", onclick: () => toggleSide() }, ico("sidebar"))
+        : h("button", { class: "round term-back", ariaLabel: `Back to ${host.name}`, onclick: back }, ico("back")),
       h("div", { class: "term-titles" }, h("span", { class: "term-title" }, title), sub),
       menu,
     );
@@ -2829,6 +3470,8 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
     // A photo or a file, put on the machine; its path goes into the box, for
     // an agent to be pointed at with whatever is written around it.
     const attachKey = h("button", { class: "round", ariaLabel: "Attach a photo or file" }, ico("attach"));
+    // Attachments go through tty7 on the machine.
+    attachKey.hidden = !!ssh;
     const picker = h("input", { type: "file", multiple: true, hidden: true });
     const compose = h("div", { class: "compose" }, attachKey, historyKey, field, sendKey, keyboard, picker);
     // Files sent to the machine, waiting to go with the message: shown by
@@ -2919,10 +3562,13 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       // device attributes, the cursor's position — stay unsent: the desktop,
       // which owns the pane, answers those already, and a second answer from
       // here arrives late, on a replay, and lands in the shell as typed text.
-      disableStdin: true,
+      // Over SSH there is no desktop, and those answers are this terminal's.
+      disableStdin: !ssh,
       // The search add-on's match highlights.
       allowProposedApi: true,
     });
+
+    if (ssh) term.onData((data) => void input(data));
 
     const search = new SearchAddon();
     term.loadAddon(search);
@@ -3108,7 +3754,27 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       hush();
       say?.();
     };
+    // A shell over SSH ends with its connection, and trying again by itself
+    // could only start a new one, or repeat a password that was turned down.
+    const sshDown = (message: string) => {
+      loaded();
+      ended = true;
+      live = false;
+      handle = null;
+      retry.cancel();
+      hush();
+      setState("offline", "Closed");
+      showBanner(sentence(message), {
+        label: "Connect",
+        run: () => {
+          ended = false;
+          clearBanner();
+          void open();
+        },
+      });
+    };
     const offline = (message: string, now = false) => {
+      if (ssh) return sshDown(message);
       if (/no such pane/i.test(message)) return gone();
       live = false;
       setState("connecting", "Reconnecting");
@@ -3486,26 +4152,44 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
     typing.addEventListener("input", (e) => {
       if (!(e as InputEvent).isComposing) flush();
     });
-    // The keys a field would keep to itself, as the terminal's: a Backspace on
-    // the empty field is the pane's, and so on. An input method's own Enter
-    // and Backspace (keyCode 229) stay with it.
-    const TYPING_KEYS: Record<string, string> = {
-      Backspace: "\x7f",
-      Enter: "\r",
-      Tab: "\t",
-      Escape: "\x1b",
-      ArrowUp: "\x1b[A",
-      ArrowDown: "\x1b[B",
-      ArrowRight: "\x1b[C",
-      ArrowLeft: "\x1b[D",
-    };
-    typing.addEventListener("keydown", (e) => {
+    // The keys a field would keep to itself, as the terminal's, Ctrl and Alt
+    // with them, for a real keyboard: a Backspace on the empty field is the
+    // pane's, and so on. An input method's own Enter and Backspace (keyCode
+    // 229) stay with it. Backspace over what the field holds goes through it,
+    // as the change `flush` sends.
+    const pressed = (e: KeyboardEvent) => {
       if (imeOpen || e.isComposing || e.keyCode === 229) return;
-      const seq = TYPING_KEYS[e.key];
-      if (!seq || (e.key === "Backspace" && typing.value)) return;
+      if (e.key === "Backspace" && typing.value && !e.ctrlKey && !e.altKey) return;
+      const seq = keyBytes(e, term.modes.applicationCursorKeysMode);
+      if (seq === null) return;
       e.preventDefault();
-      send(e.shiftKey && e.key === "Tab" ? "\x1b[Z" : seq);
+      send(seq);
+    };
+    typing.addEventListener("keydown", pressed);
+    // Pasted with the keyboard, as a paste, not as if typed: the field keeps
+    // out of it, and a program that asked to know gets the brackets.
+    typing.addEventListener("paste", (e) => {
+      const text = e.clipboardData?.getData("text");
+      if (!text) return;
+      e.preventDefault();
+      const body = text.replace(/\r?\n/g, "\r");
+      send(term.modes.bracketedPasteMode ? `\x1b[200~${body}\x1b[201~` : body);
     });
+    if (pad) {
+      paneKeys = {
+        find: () => finding(!!findBar.hidden),
+        press: (e) => {
+          typing.focus({ preventScroll: true });
+          pressed(e);
+        },
+      };
+    }
+    // With keys to hand, the pane has them from the start.
+    const claimKeys = () => {
+      if (!hardKeyboard) return;
+      if (document.activeElement !== field) typing.focus({ preventScroll: true });
+    };
+    window.addEventListener("hard-keyboard", claimKeys);
 
     // Two ways to show a pane wider than the phone. Fitted, the font shrinks
     // until every column shows; readable, the font stays legible and the view
@@ -3932,8 +4616,8 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       if (hinted || wanted || leased || seen >= 3 || !live || banner.hasChildNodes()) return;
       hinted = true;
       remember("hint.phoneSize", String(seen + 1));
-      showBanner("Wider than this phone.", {
-        label: "Use phone size",
+      showBanner(`Wider than this ${device}.`, {
+        label: `Use ${device} size`,
         run: () => {
           remember("hint.phoneSize", "3");
           banner.replaceChildren();
@@ -3978,7 +4662,7 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       api.paneLease(handle, grid).catch(() => {});
     };
     // Taken over is said under the title, beside Live.
-    const liveLabel = () => (leased ? "Live · phone size" : "Live");
+    const liveLabel = () => (leased && !ssh ? `Live · ${device} size` : "Live");
     const toggleTake = () => {
       wanted = !wanted;
       remember(takeKey, wanted ? "1" : "");
@@ -4248,10 +4932,9 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       retry.cancel();
       if (!banner.hasChildNodes() && !quiet) setState("connecting", "Connecting");
       try {
-        const opened = await api.paneOpen(
-          host.id,
-          place?.key ?? null,
-          pane.id,
+        const stream = (onOutput: (bytes: Uint8Array) => void, onEvent: (event: api.PaneEvent) => void) =>
+          ssh ? sshConnect(ssh, takeGrid(), onOutput, onEvent) : api.paneOpen(host.id, place?.key ?? null, pane.id, onOutput, onEvent);
+        const opened = await stream(
           (bytes) => {
             if (!current()) return;
             replay();
@@ -4279,6 +4962,7 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
                 cwd.textContent = where(event.path);
                 break;
               case "exited":
+                if (ssh) return sshDown(event.code ? `The shell exited with code ${event.code}.` : "The shell ended.");
                 ended = true;
                 live = false;
                 handle = null;
@@ -4449,6 +5133,8 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
       window.removeEventListener("viewport", viewport);
       clearTimeout(regrid);
       window.removeEventListener("theme", retheme);
+      window.removeEventListener("hard-keyboard", claimKeys);
+      paneKeys = null;
       if (handle !== null) api.paneClose(handle);
       term.dispose();
     };
@@ -4457,7 +5143,7 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
     // does not is opened again, and the pane replays its screen onto a reset
     // terminal — never a gap.
     onResume = () => {
-      if (ended) return;
+      if (ended || ssh) return;
       const was = handle;
       if (was === null || !live) return reopen();
       const again = () => {
@@ -4492,10 +5178,11 @@ function terminalScreen(host: Host, place: Place, pane: PaneView, title: string,
         fit();
         edited();
         open();
+        claimKeys();
       });
     });
     return view;
-  });
+  }, "main");
 }
 
 if (prefs.lock) lock();
@@ -4524,6 +5211,9 @@ void listening.then(() =>
         pairScreen(code);
       } else if (last) hostScreen(last, "push");
       else hostsScreen("push");
+      // The tablet's own Linux is what it opens to, unless a tty7 pane was
+      // left open on a machine to come back to.
+      if (pad && !code && !(last && /"host":"(?!ssh:)/.test(remembered("pad.pane") ?? ""))) openSsh(sshProfiles()[0]);
       started = true;
       void takeLink();
     },

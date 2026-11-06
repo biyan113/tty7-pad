@@ -1,3 +1,4 @@
+# Modified for tty7-pad; see NOTICE.
 # Add project specific ProGuard rules here.
 # You can control the set of applied configuration files using the
 # proguardFiles setting in build.gradle.
@@ -19,3 +20,7 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# lib.rs reaches these by name over JNI, which R8 can't see: renamed or
+# stripped, the keyboard and keep-alive calls fail in a release build.
+-keep class dev.tty7.mobile.MainActivity { public *; }

@@ -1,3 +1,4 @@
+// Modified for tty7-pad; see NOTICE.
 import java.util.Properties
 
 plugins {
@@ -29,7 +30,9 @@ android {
     namespace = "dev.tty7.mobile"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "dev.tty7.mobile"
+        // Its own app beside tty7 mobile: pairs and installs separately. The
+        // namespace stays, as Tauri's generated code lives under it.
+        applicationId = "dev.tty7.pad"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

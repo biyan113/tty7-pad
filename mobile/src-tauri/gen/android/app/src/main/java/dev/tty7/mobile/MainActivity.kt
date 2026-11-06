@@ -1,8 +1,10 @@
+// Modified for tty7-pad; see NOTICE.
 package dev.tty7.mobile
 
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.webkit.WebView
@@ -13,6 +15,8 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  private var page: WebView? = null
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
@@ -24,6 +28,7 @@ class MainActivity : TauriActivity() {
   // to the page instead (main.ts `native-keyboard`), which then lays out as
   // it does on iOS. The WebView still sees the insets itself.
   override fun onWebViewCreate(webView: WebView) {
+    page = webView
     ViewCompat.setOnApplyWindowInsetsListener(webView) { view, insets ->
       val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom / view.resources.displayMetrics.density
       webView.evaluateJavascript(
@@ -32,6 +37,24 @@ class MainActivity : TauriActivity() {
       )
       ViewCompat.onApplyWindowInsets(view, insets)
     }
+  }
+
+  // A keyboard with keys, docked or over Bluetooth (lib.rs `hard_keyboard`).
+  @Suppress("unused")
+  fun hasHardKeyboard(): Boolean {
+    val config = resources.configuration
+    return config.keyboard == Configuration.KEYBOARD_QWERTY &&
+      config.hardKeyboardHidden == Configuration.HARDKEYBOARDHIDDEN_NO
+  }
+
+  // One coming or going arrives here rather than restarting the activity
+  // (`configChanges` in the manifest), and the page is told.
+  override fun onConfigurationChanged(newConfig: Configuration) {
+    super.onConfigurationChanged(newConfig)
+    page?.evaluateJavascript(
+      "window.dispatchEvent(new CustomEvent('native-hard-keyboard', { detail: { on: ${hasHardKeyboard()} } }))",
+      null,
+    )
   }
 
   // Keeps the connection to `host` up in the background, or stops when it is

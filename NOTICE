@@ -1,0 +1,22 @@
+tty7-pad
+Copyright (c) 2026 biyan
+
+tty7-pad is a derivative of tty7 (https://github.com/l0ng-ai/tty7),
+Copyright 2026 l0ng-ai, licensed under the Apache License, Version 2.0.
+It was imported at upstream commit 8ad8841.
+
+Licensing:
+- The changes made in this repository are under the MIT License (LICENSE).
+- The upstream code stays under the Apache License 2.0 (LICENSE-APACHE).
+- Bundled third-party code and fonts keep their own licenses, found beside them.
+
+New in this repository: Cargo.toml, README.md, NOTICE, LICENSE,
+mobile/src-tauri/src/ssh.rs.
+
+Modified from upstream (each carries a note where the format allows):
+mobile/src/main.ts, mobile/src/api.ts, mobile/src/icons.ts,
+mobile/src/style.css, mobile/src-tauri/src/lib.rs,
+mobile/src-tauri/Cargo.toml, mobile/src-tauri/Cargo.lock, and under
+mobile/src-tauri/gen/android/app: build.gradle.kts, proguard-rules.pro,
+src/main/AndroidManifest.xml, src/main/res/values/strings.xml,
+src/main/java/dev/tty7/mobile/MainActivity.kt.

@@ -1,3 +1,4 @@
+# Modified for tty7-pad; see NOTICE.
 [package]
 name = "tty7-mobile"
 version = "0.1.0"
@@ -27,6 +28,11 @@ tty7-mobile-proto = { path = "../../crates/tty7-mobile-proto" }
 anyhow = "1"
 iroh = "1.2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Plain SSH to a machine with no tty7 on it (src/ssh.rs), on ring like
+# everything else here: aws-lc needs CMake and a C toolchain per Android
+# target. Not the desktop's pinned 0.62 fork: its ed25519-dalek rc can't sit
+# beside this lockfile's iroh, and 0.63.2+ has the zlib fix the fork is for.
+russh = { version = "0.63.2", default-features = false, features = ["ring", "rsa", "flate2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }

@@ -1,4 +1,5 @@
+<!-- Modified for tty7-pad; see NOTICE. -->
 <resources>
-    <string name="app_name">"tty7"</string>
-    <string name="main_activity_title">"tty7"</string>
+    <string name="app_name">"tty7 Pad"</string>
+    <string name="main_activity_title">"tty7 Pad"</string>
 </resources>

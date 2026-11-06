@@ -1,3 +1,4 @@
+// Modified for tty7-pad; see NOTICE.
 // The frontend's view of the Rust side: typed wrappers over its commands, and
 // the shapes that cross the bridge. The wire types mirror tty7-mobile-proto;
 // its tests pin the tags these match on.
@@ -115,6 +116,7 @@ export interface Insets {
 
 /** What the system bars cover, in CSS pixels. Android only: zero elsewhere. */
 export const insets = () => invoke<Insets>("insets");
+export const hardKeyboard = () => invoke<boolean>("hard_keyboard");
 
 /** The `tty7pair:` link the app was opened with and has not handled, once. */
 export const openedLink = () => invoke<string | null>("opened_link");
@@ -157,6 +159,32 @@ export function paneOpen(
   };
   return invoke<number>("pane_open", { hostId, machine, paneId, onOutput: channel });
 }
+
+/** A shell over plain SSH, on the same handle as a pane: `paneInput`,
+ * `paneLease` and `paneClose` all work on what this returns. It fails with
+ * `hostkey:<fingerprint>` for a server key not yet trusted, and `auth:password`
+ * or `auth:wrong` when a password is wanted. */
+export interface SshTarget {
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  fingerprint?: string;
+  remember: boolean;
+  cols: number;
+  rows: number;
+}
+
+export function sshOpen(target: SshTarget, onOutput: (bytes: Uint8Array) => void, onEvent: (event: PaneEvent) => void) {
+  const channel = new Channel<ArrayBuffer | PaneEvent>();
+  channel.onmessage = (msg) => {
+    if (msg instanceof ArrayBuffer) onOutput(new Uint8Array(msg));
+    else onEvent(msg);
+  };
+  return invoke<number>("ssh_open", { target, onOutput: channel });
+}
+
+export const sshPublicKey = () => invoke<string>("ssh_public_key");
 
 export interface TabCreated {
   tab_id: string;

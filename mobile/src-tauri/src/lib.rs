@@ -1,3 +1,4 @@
+// Modified for tty7-pad; see NOTICE.
 //! The Rust half of the tty7 mobile app.
 //!
 //! The WebView draws; this side holds the network. The phone's iroh endpoint,
@@ -30,6 +31,8 @@ const OUTPUT_BATCH_MAX: usize = 256 * 1024;
 /// How often the link's path and round trip are reported while a machine is
 /// on screen.
 const LINK_REPORT: Duration = Duration::from_secs(2);
+
+mod ssh;
 
 struct AppState {
     dir: PathBuf,
@@ -652,6 +655,9 @@ pub fn run() {
             pane_close,
             appearance,
             insets,
+            hard_keyboard,
+            ssh::ssh_open,
+            ssh::ssh_public_key,
             to_background,
             opened_link
         ])
@@ -1086,6 +1092,34 @@ async fn insets(window: tauri::WebviewWindow) -> Insets {
     {
         let _ = window;
         Insets::default()
+    }
+}
+
+/// Whether a keyboard with keys is attached: the tablet's dock or Bluetooth.
+/// Asked once as the page starts; MainActivity says when it changes.
+#[tauri::command]
+async fn hard_keyboard(window: tauri::WebviewWindow) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = window.with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _| {
+                let attached = env
+                    .call_method(activity, "hasHardKeyboard", "()Z", &[])
+                    .and_then(|v| v.z())
+                    .unwrap_or_else(|_| {
+                        let _ = env.exception_clear();
+                        false
+                    });
+                let _ = tx.send(attached);
+            })
+        });
+        rx.await.unwrap_or(false)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = window;
+        false
     }
 }
 
